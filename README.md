@@ -1,3 +1,6 @@
+# READ
+highly vibecoded ( ai coded ) fork of https://github.com/JakeStanger/mpd-discord-rpc that extracts the album/music icon from the local file instead of looking it up on the internet. uploads icon to https://litterbox.catbox.moe and uses that in the discord rpc logic. again, vibecoded ( ai coded ) 
+
 # MPD Discord RPC
 
 ![crates.io](https://img.shields.io/crates/v/mpd-discord-rpc)
