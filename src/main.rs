@@ -1,18 +1,16 @@
 use std::time::Duration;
-
-use discord_presence::models::ActivityButton;
-use discord_presence::models::EventData;
-use discord_presence::models::{ActivityType, DisplayType};
-use discord_presence::{Client as DiscordClient, DiscordError};
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use discord_presence::models::ActivityType;
+use discord_presence::Client as DiscordClient;
 use mpd_client::client::ConnectionEvent::SubsystemChange;
 use mpd_client::client::Subsystem;
 use mpd_client::commands;
-use mpd_client::responses::{PlayState, Song, SongInQueue, Status};
+use mpd_client::responses::{PlayState, SongInQueue, Status};
 use mpd_utils::MultiHostClient;
 use regex::Regex;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
-use tracing::{debug, error, info};
 
 use crate::album_art::AlbumArtClient;
 use crate::config::DisplayType as ConfigDisplayType;
@@ -25,99 +23,69 @@ mod mpd_conn;
 
 pub const IDLE_TIME: u64 = 3;
 
-fn map_display_type(display_type: ConfigDisplayType) -> DisplayType {
+fn map_display_type(display_type: ConfigDisplayType) -> discord_presence::models::DisplayType {
     match display_type {
-        ConfigDisplayType::Name => DisplayType::Name,
-        ConfigDisplayType::State => DisplayType::State,
-        ConfigDisplayType::Details => DisplayType::Details,
+        ConfigDisplayType::Name => discord_presence::models::DisplayType::Name,
+        ConfigDisplayType::State => discord_presence::models::DisplayType::State,
+        ConfigDisplayType::Details => discord_presence::models::DisplayType::Details,
     }
 }
 
 struct Tokens {
     details: Vec<String>,
     state: Vec<String>,
-    large_text: Vec<String>,
-    small_text: Vec<String>,
-    button1_text: Vec<String>,
-    button1_link: Vec<String>,
-    button2_text: Vec<String>,
-    button2_link: Vec<String>,
 }
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
-
     let re = Regex::new(r"\$(\w+)").expect("Failed to parse regex");
-
     let config = Config::load();
-    let format = &config.format;
 
     let tokens = Tokens {
-        details: get_tokens(&re, &format.details),
-        state: get_tokens(&re, &format.state),
-        large_text: get_tokens(&re, &format.large_text),
-        small_text: get_tokens(&re, &format.small_text),
-        button1_text: get_tokens(&re, &format.button1_text),
-        button1_link: get_tokens(&re, &format.button1_link),
-        button2_text: get_tokens(&re, &format.button2_text),
-        button2_link: get_tokens(&re, &format.button2_link),
+        details: get_tokens(&re, &config.format.details),
+        state: get_tokens(&re, &config.format.state),
     };
 
-    // MPD and Discord connections
     let mut mpd = MultiHostClient::new(config.hosts.clone(), Duration::from_secs(IDLE_TIME));
     mpd.init();
 
     let (tx, mut rx) = mpsc::channel(16);
-    let mut service = Service::new(&config, tokens, tx);
-    service.start();
+    let service = Arc::new(Mutex::new(Service::new(&config, tokens, tx)));
+    
+    {
+        let mut s = service.lock().await;
+        s.start();
+    }
+
+    println!("[RPC] Service Started. Monitoring MPD...");
 
     loop {
         tokio::select! {
             Ok(event) = mpd.recv() => {
                 if matches!(*event, SubsystemChange(Subsystem::Player | Subsystem::Queue)) {
-                    info!("Detected change, updating status");
-                    debug!("Change: {event:?}");
-
-                    if let Ok((Some(status), current_song)) = mpd.with_client(|client| async move {
+                    let s_clone = Arc::clone(&service);
+                    let _ = mpd.with_client(|client| async move {
                         let status = client.command(commands::Status).await.ok();
-
                         let current_song = if status.is_some() {
                             client.command(commands::CurrentSong).await.ok().flatten()
                         } else {
                             None
                         };
-
-                        (status, current_song)
-                    }).await {
-                        service.update_state(&status, current_song).await;
-                    }
+                        if let Some(st) = status {
+                            let mut s = s_clone.lock().await;
+                            s.update_state(&st, current_song, &client).await;
+                        }
+                    }).await;
                 }
             }
             Some(event) = rx.recv() => {
                 match event {
-                    ServiceEvent::Ready => {
-                        info!("Connected to Discord");
-
-                        // set initial status as soon as ready
-                        if let Ok((Some(status), current_song)) = mpd.with_client(|client| async move {
-                            let status = client.command(commands::Status).await.ok();
-
-                            let current_song = if status.is_some() {
-                                client.command(commands::CurrentSong).await.ok().flatten()
-                            } else {
-                                None
-                            };
-
-                            (status, current_song)
-                        }).await {
-                            service.update_state(&status, current_song).await;
-                        }
-                    },
+                    ServiceEvent::Ready => println!("[RPC] Discord Gateway Ready."),
                     ServiceEvent::Error(err) => {
-                        error!("{err}");
+                        println!("[RPC] Error: {}", err);
                         sleep(Duration::from_secs(IDLE_TIME)).await;
-                        service.start();
+                        let mut s = service.lock().await;
+                        s.start();
                     }
                 }
             },
@@ -125,10 +93,7 @@ async fn main() {
     }
 }
 
-enum ServiceEvent {
-    Ready,
-    Error(String),
-}
+enum ServiceEvent { Ready, Error(String) }
 
 struct Service<'a> {
     config: &'a Config,
@@ -139,221 +104,70 @@ struct Service<'a> {
 
 impl<'a> Service<'a> {
     fn new(config: &'a Config, tokens: Tokens, event_tx: mpsc::Sender<ServiceEvent>) -> Self {
-        let event_tx2 = event_tx.clone();
-        let event_tx3 = event_tx.clone();
-        let event_tx4 = event_tx.clone();
-
-        let drpc =
-            DiscordClient::with_error_config(config.id, Duration::from_secs(IDLE_TIME), Some(0));
-
-        drpc.on_ready(move |_| {
-            info!("discord rpc ready");
-            event_tx
-                .try_send(ServiceEvent::Ready)
-                .expect("channel to be open");
-        })
-        .persist();
-
-        drpc.on_connected(move |_| {
-            info!("discord rpc connected");
-            event_tx2
-                .try_send(ServiceEvent::Ready)
-                .expect("channel to be open");
-        })
-        .persist();
-
-        drpc.on_disconnected(move |_| {
-            info!("discord rpc disconnected");
-
-            event_tx3
-                .try_send(ServiceEvent::Error("disconnected".to_string()))
-                .expect("channel to be open");
-        })
-        .persist();
-
-        drpc.on_error(move |err| {
-            if let EventData::Error(err) = err.event {
-                error!("{err:?}");
-                let msg = err.message.unwrap_or_default();
-                if msg.to_lowercase().starts_with("io err") {
-                    event_tx4
-                        .try_send(ServiceEvent::Error(msg))
-                        .expect("channel to be open");
-                }
-            }
-        })
-        .persist();
-
-        let album_art_client = AlbumArtClient::new();
-        Self {
-            config,
-            album_art_client,
-            drpc,
-            tokens,
-        }
+        let drpc = DiscordClient::with_error_config(config.id, Duration::from_secs(IDLE_TIME), Some(0));
+        let tx = event_tx.clone();
+        drpc.on_ready(move |_| { let _ = tx.try_send(ServiceEvent::Ready); }).persist();
+        
+        Self { config, album_art_client: AlbumArtClient::new(), drpc, tokens }
     }
 
-    fn start(&mut self) {
-        info!("starting drpc client");
-        self.drpc.start();
-    }
+    fn start(&mut self) { self.drpc.start(); }
 
-    async fn update_state(&mut self, status: &Status, current_song: Option<SongInQueue>) {
-        // https://discord.com/developers/docs/rich-presence/how-to#updating-presence-update-presence-payload
+    async fn update_state(&mut self, status: &Status, current_song: Option<SongInQueue>, client: &mpd_client::Client) {
         const MAX_BYTES: usize = 128;
-
-        let format = &self.config.format;
-
         if matches!(status.state, PlayState::Playing) {
             if let Some(song_in_queue) = current_song {
                 let song = song_in_queue.song;
+                let mut details = clamp(replace_tokens(&self.config.format.details, &self.tokens.details, &song, status), MAX_BYTES);
+                let state = clamp(replace_tokens(&self.config.format.state, &self.tokens.state, &song, status), MAX_BYTES);
+                
+                while details.chars().count() < 2 { details.push('\u{200B}'); }
 
-                let mut details = clamp(
-                    replace_tokens(&format.details, &self.tokens.details, &song, status),
-                    MAX_BYTES,
-                );
-                let state = clamp(
-                    replace_tokens(&format.state, &self.tokens.state, &song, status),
-                    MAX_BYTES,
-                );
-                let large_text =
-                    replace_tokens(&format.large_text, &self.tokens.large_text, &song, status);
-                let small_text =
-                    replace_tokens(&format.small_text, &self.tokens.small_text, &song, status);
+                let url = self.album_art_client.get_album_art_url(&song, client).await;
+                let timestamps = get_timestamp(status, self.config.format.timestamp);
 
-                let button1_text = replace_tokens(
-                    &format.button1_text,
-                    &self.tokens.button1_text,
-                    &song,
-                    status,
-                );
-                let button1_link = replace_tokens(
-                    &format.button1_link,
-                    &self.tokens.button1_link,
-                    &song,
-                    status,
-                );
-                let button2_text = replace_tokens(
-                    &format.button2_text,
-                    &self.tokens.button2_text,
-                    &song,
-                    status,
-                );
-                let button2_link = replace_tokens(
-                    &format.button2_link,
-                    &self.tokens.button2_link,
-                    &song,
-                    status,
-                );
-
-                // discord requires details to be at least two characters. So extend it with
-                // zero-width spaces if it's too short. https://en.wikipedia.org/wiki/Zero-width_space
-                while details.chars().count() < 2 {
-                    details.push('\u{200B}');
+                if let Some(ref u) = url {
+                    println!("[RPC] Updating Presence with Art: {}", u);
+                } else {
+                    println!("[RPC] Updating Presence (No Art Found). Fallback: {}", self.config.format.large_image);
                 }
 
-                let timestamps = get_timestamp(status, format.timestamp);
-
-                let url = self.album_art_client.get_album_art_url(song).await;
-
-                let display_type = map_display_type(format.display_type);
-
-                let res = self.drpc.set_activity(|act| {
-                    let mut act = act
-                        .state(state)
-                        .activity_type(ActivityType::Listening)
-                        .details(details)
-                        .status_display(display_type)
+                let _ = self.drpc.set_activity(|act| {
+                    act.state(state).details(details).activity_type(ActivityType::Listening)
+                        .status_display(map_display_type(self.config.format.display_type))
                         .assets(|mut assets| {
-                            match url {
-                                Some(url) => assets = assets.large_image(url),
-                                None => {
-                                    if !format.large_image.is_empty() {
-                                        assets = assets.large_image(&format.large_image);
-                                    }
-                                }
-                            }
-
-                            if !format.small_image.is_empty() {
-                                assets = assets.small_image(&format.small_image);
-                            }
-                            if !large_text.is_empty() {
-                                assets = assets.large_text(large_text);
-                            }
-                            if !small_text.is_empty() {
-                                assets = assets.small_text(small_text);
+                            if let Some(u) = url { assets = assets.large_image(u); }
+                            else if !self.config.format.large_image.is_empty() {
+                                assets = assets.large_image(&self.config.format.large_image);
                             }
                             assets
-                        })
-                        .timestamps(|_| timestamps);
-
-                    // add buttons. This should suffice since only 2 are supported by Discord
-                    if !button1_text.is_empty() && !button1_link.is_empty() {
-                        act = act.append_buttons(|_| {
-                            ActivityButton::new().label(button1_text).url(button1_link)
-                        });
-                    }
-                    if !button2_text.is_empty() && !button2_link.is_empty() {
-                        act = act.append_buttons(|_| {
-                            ActivityButton::new().label(button2_text).url(button2_link)
-                        });
-                    }
-                    act
+                        }).timestamps(|_| timestamps)
                 });
-
-                if let Err(why) = res {
-                    // api returns a bogus error about missing buttons but succeeds anyway
-                    // so don't log it
-                    if !matches!(&why, DiscordError::JsonError(err) if err.to_string().starts_with("missing field `buttons`"))
-                    {
-                        error!("Failed to set activity: {why:?}");
-                    }
-                }
             }
-        } else if let Err(why) = self.drpc.clear_activity() {
-            error!("Failed to clear activity: {why:?}");
+        } else { 
+            println!("[RPC] Player Paused/Stopped. Clearing activity.");
+            let _ = self.drpc.clear_activity(); 
         }
     }
 }
 
-/// Extracts the formatting tokens from a formatting string
 fn get_tokens(re: &Regex, format_string: &str) -> Vec<String> {
-    re.captures_iter(format_string)
-        .map(|caps| caps[1].to_string())
-        .collect::<Vec<_>>()
+    re.captures_iter(format_string).map(|caps| caps[1].to_string()).collect()
 }
 
-/// Replaces each of the formatting tokens in the formatting string
-/// with actual data pulled from MPD
-fn replace_tokens(
-    format_string: &str,
-    tokens: &Vec<String>,
-    song: &Song,
-    status: &Status,
-) -> String {
-    let mut compiled_string = format_string.to_string();
-    for token in tokens {
-        let value = mpd_conn::get_token_value(song, status, token);
-        compiled_string = compiled_string.replace(format!("${token}").as_str(), value.as_str());
+fn replace_tokens(format_string: &str, tokens: &Vec<String>, song: &mpd_client::responses::Song, status: &Status) -> String {
+    let mut res = format_string.to_string();
+    for t in tokens {
+        let val = mpd_conn::get_token_value(song, status, t);
+        res = res.replace(&format!("${t}"), &val);
     }
-    compiled_string
+    res
 }
 
-/// Clamps a string to a specified length (byte count).
-///
-/// If a string is longer than the max length,
-/// it is cut down and ellipses are added
-/// to make the byte count equal to or just below the max.
 fn clamp(mut str: String, len: usize) -> String {
-    const ELLIPSES_LEN: usize = 3;
-
     if str.len() > len {
-        while str.len() > (len - ELLIPSES_LEN) {
-            str.pop();
-        }
-
+        str.truncate(len - 3);
         str.push_str("...");
     }
-
     str
 }
