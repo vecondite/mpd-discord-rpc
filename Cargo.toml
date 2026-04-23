@@ -18,7 +18,7 @@ assets = [
 ]
 
 [dependencies]
-lofty = "0.21"
+lofty = "0.24"
 discord-presence = { version = "3.2.0" }
 mpd_client = "1.4.1"
 regex = "1.12.3"
